@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, threading
-from typing import List, Tuple, Optional, Set
+import os, threading, json, shutil, html
+from typing import List, Tuple, Optional, Set, Dict, Any
+from datetime import datetime, timezone
+from pathlib import Path
 from PIL import Image
 
 from PySide6.QtCore import Qt, QSize, Signal, QObject
@@ -111,8 +113,12 @@ class MainWindow(QMainWindow):
         # Bottom bar
         bottom = QWidget(); bottom_l = QHBoxLayout(bottom)
         bottom_l.addStretch(1)
+        export_btn = QPushButton("Export to HTML…"); export_btn.clicked.connect(self.on_export_html)
+        save_json_btn = QPushButton("Save JSON…"); save_json_btn.clicked.connect(self.on_save_json)
+        write_btn = QPushButton("Write back to Chrome…"); write_btn.clicked.connect(self.on_write_back)
         clear_btn = QPushButton("Clear preview cache"); clear_btn.clicked.connect(self.on_clear_cache)
-        bottom_l.addWidget(clear_btn)
+        for b in (export_btn, save_json_btn, write_btn, clear_btn):
+            bottom_l.addWidget(b)
         lay.addWidget(bottom)
 
         self.setCentralWidget(central)
@@ -125,6 +131,8 @@ class MainWindow(QMainWindow):
         self._edit_links: Optional[List[BmLink]] = None  # editable working set
         self._ignore_selection: bool = False            # suppress preview during refreshes
         self._preview_seq: int = 0                      # cancels stale previews
+        self._chrome_profile_path: Optional[Path] = None
+        self._chrome_profile_name: Optional[str] = None
 
     # ---- UI actions ----
     def on_toggle_check(self):
@@ -136,6 +144,7 @@ class MainWindow(QMainWindow):
             return
         self.file_edit.setText(path)
         self._links_cache = None
+        self._chrome_profile_path = None
         try:
             links = load_bookmarks_html(path)
             self._edit_links = list(links)
@@ -169,6 +178,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Chrome", str(e)); return
         self._links_cache = list(links)
         self._edit_links = list(links)
+        self._chrome_profile_path = Path(bpath)
+        self._chrome_profile_name = prof_name
         self.file_edit.setText(f"Chrome: {prof_name}")
         folders = gather_folder_paths(links)
         self.folder_combo.blockSignals(True)
@@ -371,6 +382,274 @@ class MainWindow(QMainWindow):
         # cancel any in-flight preview and rescan
         self._preview_seq += 1
         self.on_scan()
+
+    # ---- Write back to Chrome ----
+    def _chrome_time_now_str(self) -> str:
+        # Chrome stores microseconds since 1601-01-01 UTC as a string
+        epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        micros = int((now - epoch).total_seconds() * 1_000_000)
+        return str(micros)
+
+    def _scan_max_id(self, node: Dict[str, Any]) -> int:
+        m = 0
+        def rec(n):
+            nonlocal m
+            if isinstance(n, dict):
+                i = n.get("id")
+                if isinstance(i, str) and i.isdigit():
+                    m = max(m, int(i))
+                for ch in n.get("children", []) or []:
+                    rec(ch)
+        rec(node)
+        return m
+
+    def on_write_back(self):
+        if not self._edit_links:
+            QMessageBox.information(self, "Write", "Nothing to write — no bookmarks loaded.")
+            return
+        # Choose target profile/bookmarks file
+        target_path: Optional[Path] = self._chrome_profile_path
+        target_name: Optional[str] = self._chrome_profile_name
+        if target_path is None:
+            profiles = find_chrome_profiles()
+            if not profiles:
+                QMessageBox.information(self, "Chrome", "Couldn't find a Chrome/Chromium profile with a Bookmarks file.")
+                return
+            if len(profiles) == 1:
+                target_name, p = profiles[0]
+                target_path = Path(p)
+            else:
+                names = [n for (n, _p) in profiles]
+                name, ok = QInputDialog.getItem(self, "Choose Chrome profile", "Write to:", names, 0, False)
+                if not ok:
+                    return
+                idx = names.index(name)
+                target_name, p = profiles[idx]
+                target_path = Path(p)
+        # Final confirmation
+        if QMessageBox.question(
+            self, "Write back to Chrome",
+            f"This will overwrite\n\n{target_name}\n{target_path}\n\nClose Chrome first. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        try:
+            # Load existing skeleton if present
+            data: Dict[str, Any]
+            if target_path.exists():
+                with open(target_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = {}
+            roots = data.get("roots") or {}
+            # Ensure roots exist
+            def ensure_root(key: str, name: str, fallback_id: str) -> Dict[str, Any]:
+                node = roots.get(key)
+                if not isinstance(node, dict):
+                    node = {"type": "folder", "name": name, "children": [], "id": fallback_id}
+                    roots[key] = node
+                if "children" not in node or not isinstance(node["children"], list):
+                    node["children"] = []
+                return node
+            bar = ensure_root("bookmark_bar", "Bookmarks bar", "1")
+            oth = ensure_root("other", "Other bookmarks", "2")
+            syn = ensure_root("synced", "Mobile bookmarks", "3")
+
+            # Fresh children we will build
+            new_children: Dict[str, List[Dict[str, Any]]] = {
+                "bookmark_bar": [],
+                "other": [],
+                "synced": [],
+            }
+
+            # ID generator (continue from current max id)
+            max_id = 0
+            for k in ("bookmark_bar", "other", "synced"):
+                max_id = max(max_id, self._scan_max_id(roots.get(k) or {}))
+            def next_id() -> str:
+                nonlocal max_id
+                max_id += 1
+                return str(max_id)
+
+            now_s = self._chrome_time_now_str()
+
+            # Helpers to build nested folders under a root
+            def ensure_folder(children: List[Dict[str, Any]], name: str) -> Dict[str, Any]:
+                for ch in children:
+                    if ch.get("type") == "folder" and ch.get("name") == name:
+                        return ch
+                node = {"type": "folder", "name": name, "children": [], "id": next_id(), "date_added": now_s, "date_modified": now_s}
+                children.append(node)
+                return node
+
+            ROOT_NAME_TO_KEY = {
+                "bookmarks bar": "bookmark_bar",
+                "other bookmarks": "other",
+                "mobile bookmarks": "synced",
+            }
+
+            # Build trees from edited links
+            for b in list(self._edit_links):
+                url = normalize_url(b.href)
+                if not url:
+                    continue
+                # Determine root and subpath
+                parts = (b.folder_path or "").strip("/").split("/") if b.folder_path else []
+                root_key = None
+                if parts:
+                    first = parts[0].strip().lower()
+                    root_key = ROOT_NAME_TO_KEY.get(first)
+                    if root_key:
+                        parts = parts[1:]
+                if not root_key:
+                    root_key = "other"
+                # Walk/construct folders
+                cur_children = new_children[root_key]
+                for seg in parts:
+                    if not seg:
+                        continue
+                    folder = ensure_folder(cur_children, seg)
+                    cur_children = folder["children"]
+                # Add URL node
+                node = {
+                    "type": "url",
+                    "name": b.title or url,
+                    "url": url,
+                    "id": next_id(),
+                    "date_added": now_s,
+                }
+                cur_children.append(node)
+
+            # Swap children
+            bar["children"] = new_children["bookmark_bar"]
+            oth["children"] = new_children["other"]
+            syn["children"] = new_children["synced"]
+            data["roots"] = roots
+            data.pop("checksum", None)  # let Chrome recompute
+            if "version" not in data:
+                data["version"] = 1
+
+            # Backup & write
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = target_path.with_name(target_path.name + f".backup-{ts}.json")
+            try:
+                if target_path.exists():
+                    shutil.copyfile(target_path, backup)
+            except Exception:
+                pass
+            with open(target_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            QMessageBox.information(self, "Write", f"Bookmarks written to:\n{target_name}\n{target_path}\n\nA backup was saved as:\n{backup.name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Write error", str(e))
+
+    # ---- Export / Save ----
+    def _build_folder_tree(self) -> Dict[str, Any]:
+        """Return a nested folder tree: {name, children:[folders|links]} from self._edit_links.
+        Links look like {type:'url', title, url}. Folders: {type:'folder', name, children}.
+        Root is an anonymous folder.
+        """
+        root = {"type": "folder", "name": "ROOT", "children": []}
+        def ensure_path(parts: List[str]) -> List[Dict[str, Any]]:
+            cur = root["children"]
+            for seg in parts:
+                seg = seg.strip()
+                if not seg:
+                    continue
+                found = None
+                for ch in cur:
+                    if ch.get("type") == "folder" and ch.get("name") == seg:
+                        found = ch; break
+                if not found:
+                    found = {"type": "folder", "name": seg, "children": []}
+                    cur.append(found)
+                cur = found["children"]
+            return cur
+        for b in list(self._edit_links or []):
+            url = normalize_url(b.href)
+            if not url:
+                continue
+            parts = (b.folder_path or "").strip("/")
+            parts_list = [p for p in parts.split("/") if p] if parts else []
+            cur_children = ensure_path(parts_list)
+            cur_children.append({
+                "type": "url",
+                "title": b.title or url,
+                "url": url,
+            })
+        return root
+
+    def _export_tree_to_html(self, node: Dict[str, Any], out, level: int = 0):
+        IND = "    " * level
+        now_unix = str(int(datetime.now(timezone.utc).timestamp()))
+        if node.get("type") == "folder":
+            name = html.escape(node.get("name", ""))
+            if level > 0:  # skip writing a heading for the anonymous root
+                out.write(f"{IND}<DT><H3 ADD_DATE=\"{now_unix}\">{name}</H3>\n")
+            if level == 0:
+                out.write(f"<DL><p>\n")
+            else:
+                out.write(f"{IND}<DL><p>\n")
+            for ch in node.get("children", []):
+                self._export_tree_to_html(ch, out, level + 1)
+            if level == 0:
+                out.write(f"</DL><p>\n")
+            else:
+                out.write(f"{IND}</DL><p>\n")
+        else:  # url
+            title = html.escape(node.get("title", ""))
+            url = html.escape(node.get("url", ""))
+            out.write(f"{IND}<DT><A HREF=\"{url}\" ADD_DATE=\"{now_unix}\">{title}</A>\n")
+
+    def on_export_html(self):
+        if not self._edit_links:
+            QMessageBox.information(self, "Export", "Nothing to export — no bookmarks loaded.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export to HTML", "Bookmarks.html", "HTML files (*.html *.htm)")
+        if not path:
+            return
+        tree = self._build_folder_tree()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n")
+                f.write("<!-- This is an automatically generated file. -->\n")
+                f.write("<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n")
+                f.write("<TITLE>Bookmarks</TITLE>\n")
+                f.write("<H1>Bookmarks</H1>\n")
+                self._export_tree_to_html(tree, f, 0)
+            QMessageBox.information(self, "Export", f"Exported to: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export error", str(e))
+
+    def on_save_json(self):
+        if not self._edit_links:
+            QMessageBox.information(self, "Save", "Nothing to save — no bookmarks loaded.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save JSON", "bookmarks.json", "JSON files (*.json)")
+        if not path:
+            return
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "count": len(self._edit_links),
+            "bookmarks": [
+                {
+                    "title": (b.title or normalize_url(b.href) or ""),
+                    "url": normalize_url(b.href) or "",
+                    "folder_path": (b.folder_path or ""),
+                }
+                for b in (self._edit_links or [])
+                if normalize_url(b.href)
+            ],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(self, "Save", f"Saved JSON to: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save error", str(e))
 
     def on_clear_cache(self):
         clear_cache(); QMessageBox.information(self, "Cache", "Preview cache cleared.")
