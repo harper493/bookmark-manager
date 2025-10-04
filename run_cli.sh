@@ -20,11 +20,12 @@ else
   python -m pip install beautifulsoup4 httpx lxml Pillow playwright PySide6 --progress-bar off -q 1>/dev/null
 fi
 
-# local Playwright browsers
+# local Playwright browsers (optional for CLI but helpful)
 export PLAYWRIGHT_BROWSERS_PATH="$DIR/.pw-browsers"
 if [ ! -d "$PLAYWRIGHT_BROWSERS_PATH" ] || \
    ! find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 1 -type d -name "chromium-*" -print -quit 2>/dev/null | grep -q . ; then
-  python -m playwright install chromium
+  python -m playwright install chromium || true
 fi
 
-exec python "$DIR/main.py"
+# Pass all args to CLI
+exec python "$DIR/main.py" --cli "$@"

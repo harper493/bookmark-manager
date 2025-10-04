@@ -22,7 +22,8 @@ Run:
   python bookmark_viewer_qt.py
 """
 
-import os, sys, io, time, threading, hashlib, glob, html, shutil, urllib.parse as urlparse
+import os, sys, io, time, threading, hashlib, glob, html, shutil, json, platform, urllib.parse as urlparse
+from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Set
 
@@ -30,14 +31,21 @@ import httpx
 from bs4 import BeautifulSoup, Tag, NavigableString
 from PIL import Image
 
-# Qt
-from PySide6.QtCore import Qt, QSize, Signal, QObject
-from PySide6.QtGui import QPixmap, QImage
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QFileDialog, QPushButton, QLineEdit, QLabel,
-    QListWidget, QListWidgetItem, QHBoxLayout, QVBoxLayout, QSplitter,
-    QProgressBar, QCheckBox, QMessageBox, QWidget
-)
+# Qt (optional; allow running in environments without PySide6)
+HAS_QT = True
+try:
+    from PySide6.QtCore import Qt, QSize, Signal, QObject
+    from PySide6.QtGui import QPixmap, QImage
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QFileDialog, QPushButton, QLineEdit, QLabel,
+        QListWidget, QListWidgetItem, QHBoxLayout, QVBoxLayout, QSplitter,
+        QProgressBar, QCheckBox, QMessageBox, QWidget, QInputDialog
+    )
+except Exception:
+    HAS_QT = False
+
+
+
 from PySide6.QtWidgets import QComboBox
 
 # ----------------------------------------------------------------------
@@ -233,6 +241,79 @@ def select_folder(links: List[BmLink], target_path: str) -> List[BmLink]:
         tci = target.lower(); return [b for b in links if b.folder_path.lower() == tci]
     seg = target.lower()
     return [b for b in links if b.folder_path.lower().split("/")[-1] == seg]
+
+# ---------------- Chrome bookmarks loader ----------------
+
+def _chrome_base_dirs() -> List[Path]:
+    dirs: List[Path] = []
+    home = Path.home()
+    if sys.platform == "darwin":
+        dirs += [
+            home / "Library/Application Support/Google/Chrome",
+            home / "Library/Application Support/Chromium",
+        ]
+    elif os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA") or ""
+        if local:
+            lp = Path(local)
+            dirs += [
+                lp / "Google/Chrome/User Data",
+                lp / "Chromium/User Data",
+            ]
+    else:  # Linux / BSD
+        dirs += [
+            home / ".config/google-chrome",
+            home / ".config/chromium",
+        ]
+    return [p for p in dirs if p.exists()]
+
+def find_chrome_profiles() -> List[Tuple[str, Path]]:
+    results: List[Tuple[str, Path]] = []
+    for base in _chrome_base_dirs():
+        # Default + Profile X
+        candidates = ["Default"]
+        try:
+            for d in sorted([d.name for d in base.iterdir() if d.is_dir() and d.name.startswith("Profile ")], key=str.lower):
+                candidates.append(d)
+        except Exception:
+            pass
+        for prof in candidates:
+            bpath = base / prof / "Bookmarks"
+            if bpath.exists() and bpath.is_file():
+                results.append((f"{base.name} / {prof}", bpath))
+    return results
+
+def load_chrome_bookmarks_file(path: Path) -> List[BmLink]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    roots = (data or {}).get("roots", {})
+    out: List[BmLink] = []
+
+    def walk(node: dict, stack: List[str]):
+        if not isinstance(node, dict):
+            return
+        t = node.get("type")
+        if t == "url":
+            url = node.get("url") or ""
+            title = node.get("name") or url
+            out.append(BmLink(title=title, href=url, folder_path="/".join(stack)))
+        elif t == "folder":
+            name = node.get("name") or ""
+            new_stack = stack + ([name] if name else [])
+            for ch in node.get("children", []) or []:
+                walk(ch, new_stack)
+
+    mapping = [
+        ("Bookmarks Bar", roots.get("bookmark_bar")),
+        ("Other Bookmarks", roots.get("other")),
+        ("Mobile Bookmarks", roots.get("synced")),
+    ]
+    for root_name, node in mapping:
+        if isinstance(node, dict):
+            base_stack = [root_name]
+            for ch in node.get("children", []) or []:
+                walk(ch, base_stack)
+    return out
 
 # ---------------- Folder listing helpers ----------------
 
@@ -448,6 +529,11 @@ def take_screenshot(url: str, width: int = VIEWPORT_WIDTH, height: int = VIEWPOR
     return img_path
 
 # ---------------- Qt App ----------------
+# If PySide6 isn't available (e.g., Canvas runner), exit gracefully instead of crashing.
+if not HAS_QT:
+    print("PySide6 is not installed in this environment. Run the app from your terminal (./run.sh) where PySide6 is available.", file=sys.stderr)
+    # Prevent defining GUI classes which depend on PySide6
+    raise SystemExit(0)
 
 class Signals(QObject):
     progress = Signal(int)
@@ -487,6 +573,8 @@ class MainWindow(QMainWindow):
 
         top_layout.addWidget(self.file_edit, 4)
         top_layout.addWidget(browse_btn, 0)
+        chrome_btn = QPushButton("Load Chrome…"); chrome_btn.clicked.connect(self.on_load_chrome)
+        top_layout.addWidget(chrome_btn, 0)
         top_layout.addWidget(self.folder_combo, 3)
         top_layout.addWidget(self.check_box, 0)
         top_layout.addWidget(scan_btn, 0)
@@ -528,6 +616,7 @@ class MainWindow(QMainWindow):
         self.items: List[Tuple[str,BmLink]] = []  # (url, BmLink)
         self._preview_thread: Optional[threading.Thread] = None  # prevent overlap
         self._scan_thread: Optional[threading.Thread] = None  # prevent parallel scans
+        self._links_cache: Optional[List[BmLink]] = None  # holds Chrome bookmarks when loaded
 
     # --- UI handlers ---
 
@@ -535,6 +624,20 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Select bookmarks HTML", "", "HTML files (*.html *.htm);;All files (*)")
         if path:
             self.file_edit.setText(path)
+            # Switching to file mode; clear any cached Chrome bookmarks
+            self._links_cache = None
+            try:
+                links = load_bookmarks(path)
+                folders = gather_folder_paths(links)
+                self.folder_combo.blockSignals(True)
+                self.folder_combo.clear()
+                self.folder_combo.addItem("All folders", "")
+                for f in folders:
+                    self.folder_combo.addItem(f, f)
+                self.folder_combo.setCurrentIndex(0)
+                self.folder_combo.blockSignals(False)
+            except Exception as e:
+                QMessageBox.warning(self, "Folder list", f"Couldn't parse folders: {e}")
             try:
                 links = load_bookmarks(path)
                 folders = gather_folder_paths(links)
@@ -554,6 +657,29 @@ class MainWindow(QMainWindow):
             self.status.setText("Scan in progress…")
             return
         path = self.file_edit.text().strip()
+        use_file = bool(path) and os.path.isfile(path) and not path.startswith("Chrome:")
+        # Determine selected folder
+        folder = (self.folder_combo.currentData() or "").strip()
+        # Validate source: either a file or loaded Chrome bookmarks
+        if not use_file and not (self._links_cache and len(self._links_cache) > 0):
+            QMessageBox.critical(self, "Missing source", "Choose a bookmarks HTML file or click 'Load Chrome…' first.")
+            return
+        # Reset UI
+        self.list.clear()
+        self.preview.setText("(Click a bookmark to preview)")
+        self.preview.setPixmap(QPixmap())
+        self.status.setText("Parsing…"); self.progress.setValue(0)
+        # Start scan thread
+        self._scan_thread = threading.Thread(
+            target=self._worker_scan,
+            args=(path if use_file else "", folder, self.check_box.isChecked()),
+            daemon=True,
+        )
+        self._scan_thread.start()
+        use_file = bool(path) and os.path.isfile(path)
+        if not use_file and not (self._links_cache and len(self._links_cache) > 0):
+            QMessageBox.critical(self, "Missing source", "Choose a bookmarks HTML file or click 'Load Chrome…' first.")
+            return
         if not path or not os.path.isfile(path):
             QMessageBox.critical(self, "Missing file", "Please choose a bookmarks HTML file.")
             return
@@ -577,18 +703,59 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Cache", f"Couldn't clear cache: {e}")
     def on_folder_changed(self, idx: int):
-        """Auto-scan when user selects a folder, if a bookmarks file is chosen."""
+        """Auto-scan when user selects a folder, if a bookmarks file or Chrome data is loaded."""
         path = self.file_edit.text().strip()
-        if not path or not os.path.isfile(path):
+        has_file = bool(path) and os.path.isfile(path)
+        has_chrome = bool(self._links_cache)
+        if not (has_file or has_chrome):
             return
         if hasattr(self, "_scan_thread") and self._scan_thread and self._scan_thread.is_alive():
             self.status.setText("Scan in progress…")
             return
         self.on_scan()
+    def on_load_chrome(self):
+        profiles = find_chrome_profiles()
+        if not profiles:
+            QMessageBox.information(self, "Chrome bookmarks", "Couldn't find a Chrome/Chromium profile with a Bookmarks file.")
+            return
+        if len(profiles) == 1:
+            chosen = 0
+        else:
+            names = [n for (n, _p) in profiles]
+            name, ok = QInputDialog.getItem(self, "Choose Chrome profile", "Profile:", names, 0, False)
+            if not ok:
+                return
+            chosen = names.index(name)
+        prof_name, bpath = profiles[chosen]
+        try:
+            links = load_chrome_bookmarks_file(Path(bpath))
+        except Exception as e:
+            QMessageBox.critical(self, "Chrome bookmarks", f"Failed to read Chrome bookmarks: {e}")
+            return
+        # Cache in-memory, populate folders, set label, auto-scan
+        self._links_cache = links
+        try:
+            folders = gather_folder_paths(links)
+            self.folder_combo.blockSignals(True)
+            self.folder_combo.clear()
+            self.folder_combo.addItem("All folders", "")
+            for f in folders:
+                self.folder_combo.addItem(f, f)
+            self.folder_combo.setCurrentIndex(0)
+            self.folder_combo.blockSignals(False)
+        except Exception:
+            pass
+        self.file_edit.setText(f"Chrome: {prof_name}")
+        self.on_scan()
 
     def _worker_scan(self, file_path: str, folder: str, do_check: bool):
         try:
-            links = load_bookmarks(file_path)
+            if file_path and os.path.isfile(file_path):
+                links = load_bookmarks(file_path)
+            elif self._links_cache is not None:
+                links = list(self._links_cache)
+            else:
+                raise RuntimeError("No bookmarks source loaded.")
             sel = select_folder(links, folder)
             # de-dupe
             seen: Set[str] = set()
