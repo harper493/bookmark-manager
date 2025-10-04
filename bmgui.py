@@ -22,7 +22,7 @@ Run:
   python bookmark_viewer_qt.py
 """
 
-import os, sys, io, time, threading, hashlib, glob, html, urllib.parse as urlparse
+import os, sys, io, time, threading, hashlib, glob, html, shutil, urllib.parse as urlparse
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Set
 
@@ -61,6 +61,58 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
 }
+
+# ---- Download/preview helpers ----
+
+def sniff_resource(url: str, timeout: float = 10.0) -> Tuple[str, str]:
+    """Return (content_type, content_disposition) via a light HEAD (fallback to range GET)."""
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True, headers=HEADERS) as c:
+            r = c.head(url)
+            if r.status_code >= 400 or not r.headers.get("content-type"):
+                # Some servers reject HEAD: do a tiny ranged GET
+                r = c.get(url, headers={"Range": "bytes=0-0"})
+            ct = (r.headers.get("content-type") or "").lower()
+            cd = (r.headers.get("content-disposition") or "").lower()
+            return ct, cd
+    except Exception:
+        return "", ""
+
+def is_html_like(ct: str) -> bool:
+    ct = ct or ""
+    return ("text/html" in ct) or ("application/xhtml+xml" in ct) or (ct.startswith("text/") and "xml" in ct)
+
+def is_image_content(ct: str) -> bool:
+    return (ct or "").startswith("image/")
+
+def is_pdf(ct: str) -> bool:
+    return "application/pdf" in (ct or "")
+
+def is_definitely_download(ct: str, cd: str) -> bool:
+    # If server says attachment OR content-type is clearly non-HTML/non-image and not PDF inline
+    if "attachment" in (cd or ""):
+        return True
+    if not ct:
+        return False
+    if is_html_like(ct) or is_image_content(ct) or is_pdf(ct):
+        return False
+    return True
+
+def fetch_image_bytes_direct(url: str, timeout: float = 12.0, max_bytes: int = 6_000_000) -> Optional[bytes]:
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True, headers=HEADERS) as c:
+            r = c.get(url)
+            if r.status_code >= 400:
+                return None
+            ct = (r.headers.get("content-type") or "").lower()
+            if not is_image_content(ct):
+                return None
+            data = r.content
+            if not data or len(data) > max_bytes:
+                return None
+            return data
+    except Exception:
+        return None
 
 # ---------------- Utilities ----------------
 
@@ -290,6 +342,19 @@ def take_screenshot(url: str, width: int = VIEWPORT_WIDTH, height: int = VIEWPOR
     if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
         return img_path
 
+    # Pre-check the resource type to avoid auto-download popups and non-previewable targets
+    ct, cd = sniff_resource(url)
+    # Direct image? Fetch and cache without launching a browser
+    if is_image_content(ct):
+        data = fetch_image_bytes_direct(url)
+        if data:
+            with open(img_path, "wb") as f:
+                f.write(data)
+            return img_path
+    # If it's a guaranteed download (zip, exe, etc.), don't try to preview
+    if is_definitely_download(ct, cd):
+        raise RuntimeError("This link triggers a file download (not a web page), so a preview isn't available.")
+
     args = []
     try:
         if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -305,6 +370,7 @@ def take_screenshot(url: str, width: int = VIEWPORT_WIDTH, height: int = VIEWPOR
             ctx = p.chromium.launch_persistent_context(
                 user_data_dir=PROFILE_DIR,
                 headless=True,
+                accept_downloads=False,
                 args=args,
                 viewport={"width": width, "height": height},
                 user_agent=HEADERS["User-Agent"],
@@ -338,6 +404,7 @@ def take_screenshot(url: str, width: int = VIEWPORT_WIDTH, height: int = VIEWPOR
             ctx2 = p.chromium.launch_persistent_context(
                 user_data_dir=PROFILE_DIR,
                 headless=False,
+                accept_downloads=False,
                 args=args,
                 viewport={"width": width, "height": height},
                 user_agent=HEADERS["User-Agent"],
@@ -410,11 +477,18 @@ class MainWindow(QMainWindow):
         self.folder_combo.addItem("All folders", "")
         self.check_box = QCheckBox("Check links before listing"); self.check_box.setChecked(True)
         scan_btn = QPushButton("Scan"); scan_btn.clicked.connect(self.on_scan)
+        clear_btn = QPushButton("Clear cache"); clear_btn.clicked.connect(self.on_clear_cache)
+        # Pressing Return in the file path field triggers Scan
+        try:
+            self.file_edit.returnPressed.connect(self.on_scan)
+        except Exception:
+            pass
 
         top_layout.addWidget(self.file_edit, 4)
         top_layout.addWidget(browse_btn, 0)
         top_layout.addWidget(self.folder_combo, 3)
         top_layout.addWidget(self.check_box, 0)
+        top_layout.addWidget(clear_btn, 0)
         top_layout.addWidget(scan_btn, 0)
 
         # Progress + status
@@ -478,6 +552,17 @@ class MainWindow(QMainWindow):
 
         t = threading.Thread(target=self._worker_scan, args=(path, folder, self.check_box.isChecked()), daemon=True)
         t.start()
+    def on_clear_cache(self):
+        """Delete cached preview images and notify the user."""
+        cache_dir = screenshot_cache_dir()
+        try:
+            if os.path.isdir(cache_dir):
+                shutil.rmtree(cache_dir)
+            # Recreate empty cache dir so future writes succeed
+            os.makedirs(cache_dir, exist_ok=True)
+            QMessageBox.information(self, "Cache cleared", "Preview cache was cleared.")
+        except Exception as e:
+            QMessageBox.warning(self, "Cache", f"Couldn't clear cache: {e}")
 
     def _worker_scan(self, file_path: str, folder: str, do_check: bool):
         try:
