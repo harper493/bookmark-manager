@@ -475,7 +475,8 @@ class MainWindow(QMainWindow):
         browse_btn = QPushButton("Browse…"); browse_btn.clicked.connect(self.on_browse)
         self.folder_combo = QComboBox(); self.folder_combo.setEditable(False)
         self.folder_combo.addItem("All folders", "")
-        self.check_box = QCheckBox("Check links before listing"); self.check_box.setChecked(True)
+        self.folder_combo.currentIndexChanged.connect(self.on_folder_changed)
+        self.check_box = QCheckBox("Check links before listing"); self.check_box.setChecked(False)
         scan_btn = QPushButton("Scan"); scan_btn.clicked.connect(self.on_scan)
         clear_btn = QPushButton("Clear cache"); clear_btn.clicked.connect(self.on_clear_cache)
         # Pressing Return in the file path field triggers Scan
@@ -488,7 +489,6 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(browse_btn, 0)
         top_layout.addWidget(self.folder_combo, 3)
         top_layout.addWidget(self.check_box, 0)
-        top_layout.addWidget(clear_btn, 0)
         top_layout.addWidget(scan_btn, 0)
 
         # Progress + status
@@ -518,10 +518,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(top)
         lay.addWidget(pbar)
         lay.addWidget(split, 1)
+        # Bottom bar: move Clear cache to bottom-right
+        bottom = QWidget(); bottom_l = QHBoxLayout(bottom)
+        bottom_l.addStretch(1)
+        bottom_l.addWidget(clear_btn)
+        lay.addWidget(bottom)
         self.setCentralWidget(central)
 
         self.items: List[Tuple[str,BmLink]] = []  # (url, BmLink)
         self._preview_thread: Optional[threading.Thread] = None  # prevent overlap
+        self._scan_thread: Optional[threading.Thread] = None  # prevent parallel scans
 
     # --- UI handlers ---
 
@@ -532,14 +538,21 @@ class MainWindow(QMainWindow):
             try:
                 links = load_bookmarks(path)
                 folders = gather_folder_paths(links)
+                self.folder_combo.blockSignals(True)
                 self.folder_combo.clear()
                 self.folder_combo.addItem("All folders", "")
                 for f in folders:
                     self.folder_combo.addItem(f, f)
+                self.folder_combo.setCurrentIndex(0)
+                self.folder_combo.blockSignals(False)
             except Exception as e:
                 QMessageBox.warning(self, "Folder list", f"Couldn't parse folders: {e}")
 
     def on_scan(self):
+        # Avoid starting another scan while one is running
+        if hasattr(self, "_scan_thread") and self._scan_thread and self._scan_thread.is_alive():
+            self.status.setText("Scan in progress…")
+            return
         path = self.file_edit.text().strip()
         if not path or not os.path.isfile(path):
             QMessageBox.critical(self, "Missing file", "Please choose a bookmarks HTML file.")
@@ -550,8 +563,8 @@ class MainWindow(QMainWindow):
         self.preview.setPixmap(QPixmap())
         self.status.setText("Parsing…"); self.progress.setValue(0)
 
-        t = threading.Thread(target=self._worker_scan, args=(path, folder, self.check_box.isChecked()), daemon=True)
-        t.start()
+        self._scan_thread = threading.Thread(target=self._worker_scan, args=(path, folder, self.check_box.isChecked()), daemon=True)
+        self._scan_thread.start()
     def on_clear_cache(self):
         """Delete cached preview images and notify the user."""
         cache_dir = screenshot_cache_dir()
@@ -563,6 +576,15 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Cache cleared", "Preview cache was cleared.")
         except Exception as e:
             QMessageBox.warning(self, "Cache", f"Couldn't clear cache: {e}")
+    def on_folder_changed(self, idx: int):
+        """Auto-scan when user selects a folder, if a bookmarks file is chosen."""
+        path = self.file_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            return
+        if hasattr(self, "_scan_thread") and self._scan_thread and self._scan_thread.is_alive():
+            self.status.setText("Scan in progress…")
+            return
+        self.on_scan()
 
     def _worker_scan(self, file_path: str, folder: str, do_check: bool):
         try:
