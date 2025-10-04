@@ -9,7 +9,7 @@ from PySide6.QtGui import QPixmap, QImage
 from PySide6.QtWidgets import (
     QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLabel, QLineEdit, QPushButton, QComboBox,
-    QProgressBar, QMessageBox, QFileDialog, QInputDialog
+    QProgressBar, QMessageBox, QFileDialog, QInputDialog, QAbstractItemView
 )
 
 from bookmarks import (
@@ -29,8 +29,9 @@ class Signals(QObject):
     progress = Signal(int)
     status = Signal(str)
     list_filled = Signal(list)            # List[Tuple[str,BmLink]]
-    preview_ready = Signal(QPixmap)
-    preview_failed = Signal(str)
+    # Include a sequence id so we can ignore stale previews completing late
+    preview_ready = Signal(int, QPixmap)
+    preview_failed = Signal(int, str)
 
 
 class MainWindow(QMainWindow):
@@ -60,11 +61,12 @@ class MainWindow(QMainWindow):
 
         top_layout.addWidget(self.file_edit, 4)
         top_layout.addWidget(browse_btn)
-        top_layout.addWidget(self.folder_combo, 3)
+        self.folder_combo.setMinimumWidth(260)
+        top_layout.addWidget(self.folder_combo, 0)
         top_layout.addWidget(self.check_btn)
         top_layout.addWidget(scan_btn)
 
-        # --- Top controls (Row 2) — move Chrome button under file selector ---
+        # --- Top controls (Row 2) — Chrome button under file selector ---
         chrome_row = QWidget(); chrome_layout = QHBoxLayout(chrome_row)
         chrome_btn = QPushButton("Load from Chrome"); chrome_btn.clicked.connect(self.on_load_chrome)
         chrome_layout.addWidget(chrome_btn)
@@ -80,7 +82,17 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal)
         left = QWidget(); left_layout = QVBoxLayout(left)
         self.list = QListWidget(); self.list.itemSelectionChanged.connect(self.on_select)
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         left_layout.addWidget(self.list)
+        # Row of actions below list
+        list_row = QWidget(); list_row_l = QHBoxLayout(list_row)
+        del_btn = QPushButton("Delete selected"); del_btn.clicked.connect(self.on_delete_selected)
+        move_btn = QPushButton("Move to folder…"); move_btn.clicked.connect(self.on_move_selected)
+        list_row_l.addWidget(del_btn)
+        list_row_l.addWidget(move_btn)
+        list_row_l.addStretch(1)
+        left_layout.addWidget(list_row)
+
         right = QWidget(); right_layout = QVBoxLayout(right)
         self.preview = QLabel("(Click a bookmark to preview)")
         self.preview.setAlignment(Qt.AlignCenter)
@@ -110,6 +122,9 @@ class MainWindow(QMainWindow):
         self._preview_thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
         self._links_cache: Optional[List[BmLink]] = None
+        self._edit_links: Optional[List[BmLink]] = None  # editable working set
+        self._ignore_selection: bool = False            # suppress preview during refreshes
+        self._preview_seq: int = 0                      # cancels stale previews
 
     # ---- UI actions ----
     def on_toggle_check(self):
@@ -123,6 +138,7 @@ class MainWindow(QMainWindow):
         self._links_cache = None
         try:
             links = load_bookmarks_html(path)
+            self._edit_links = list(links)
             folders = gather_folder_paths(links)
             self.folder_combo.blockSignals(True)
             self.folder_combo.clear(); self.folder_combo.addItem("All folders", "")
@@ -151,7 +167,8 @@ class MainWindow(QMainWindow):
             links = load_chrome_bookmarks_file(bpath)
         except Exception as e:
             QMessageBox.critical(self, "Chrome", str(e)); return
-        self._links_cache = links
+        self._links_cache = list(links)
+        self._edit_links = list(links)
         self.file_edit.setText(f"Chrome: {prof_name}")
         folders = gather_folder_paths(links)
         self.folder_combo.blockSignals(True)
@@ -165,10 +182,15 @@ class MainWindow(QMainWindow):
     def on_scan(self):
         if self._scan_thread and self._scan_thread.is_alive():
             self.status.setText("Scan in progress…"); return
+        # suppress selection-driven previews while we rebuild the list
+        self._ignore_selection = True
+        # cancel any in-flight preview by bumping seq
+        self._preview_seq += 1
         path = self.file_edit.text().strip()
         use_file = bool(path) and os.path.isfile(path) and not path.startswith("Chrome:")
         folder = (self.folder_combo.currentData() or "").strip()
-        self.list.clear(); self.preview.setText("(Click a bookmark to preview)"); self.preview.setPixmap(QPixmap())
+        self.list.clear(); self.list.clearSelection()
+        self.preview.setText("(Click a bookmark to preview)"); self.preview.setPixmap(QPixmap())
         self.status.setText("Parsing…"); self.progress.setValue(0)
         self._scan_thread = threading.Thread(target=self._worker_scan, args=(path if use_file else "", folder, self.check_btn.isChecked()), daemon=True)
         self._scan_thread.start()
@@ -176,7 +198,7 @@ class MainWindow(QMainWindow):
     def on_folder_changed(self, idx: int):
         path = self.file_edit.text().strip(); has_file = bool(path) and os.path.isfile(path)
         has_chrome = bool(self._links_cache)
-        if not (has_file or has_chrome):
+        if not (has_file or has_chrome or self._edit_links):
             return
         if self._scan_thread and self._scan_thread.is_alive():
             self.status.setText("Scan in progress…"); return
@@ -184,7 +206,9 @@ class MainWindow(QMainWindow):
 
     def _worker_scan(self, file_path: str, folder: str, do_check: bool):
         try:
-            if file_path:
+            if self._edit_links is not None:
+                links = list(self._edit_links)
+            elif file_path:
                 links = load_bookmarks_html(file_path)
             elif self._links_cache is not None:
                 links = list(self._links_cache)
@@ -206,23 +230,41 @@ class MainWindow(QMainWindow):
 
     def on_list_filled(self, items: list):
         self.items = items
+        # Avoid triggering selection events while we fill
+        self.list.blockSignals(True)
+        self.list.clear()
         for u, b in items:
             it = QListWidgetItem(f"{b.title}   —   {host_of(u)}"); it.setData(Qt.UserRole, u)
             self.list.addItem(it)
+        self.list.blockSignals(False)
+        # Ensure nothing is selected and no current item
+        self.list.clearSelection()
+        try:
+            self.list.setCurrentRow(-1)
+        except Exception:
+            pass
         if not items:
             self.status.setText("No links found.")
+        # allow selection again
+        self._ignore_selection = False
 
     def on_select(self):
+        if self._ignore_selection:
+            return
         if self._preview_thread and self._preview_thread.is_alive():
             self.status.setText("Preview in progress…"); return
         sel = self.list.currentItem();
-        if not sel: return
+        if not sel:
+            return
         url = sel.data(Qt.UserRole)
         self.status.setText("Capturing screenshot…")
-        self._preview_thread = threading.Thread(target=self._worker_preview, args=(url,), daemon=True)
+        # start a new preview sequence; this cancels any late arrivals
+        self._preview_seq += 1
+        seq = self._preview_seq
+        self._preview_thread = threading.Thread(target=self._worker_preview, args=(seq, url,), daemon=True)
         self._preview_thread.start()
 
-    def _worker_preview(self, url: str):
+    def _worker_preview(self, seq: int, url: str):
         try:
             path = take_screenshot(url)
             im = Image.open(path); im.load()
@@ -232,14 +274,19 @@ class MainWindow(QMainWindow):
             data = im.tobytes("raw", "RGBA")
             qimg = QImage(data, im.width, im.height, QImage.Format_RGBA8888)
             pm = QPixmap.fromImage(qimg)
-            self.sig.preview_ready.emit(pm)
+            self.sig.preview_ready.emit(seq, pm)
         except Exception as e:
-            self.sig.preview_failed.emit(str(e))
+            self.sig.preview_failed.emit(seq, str(e))
 
-    def on_preview_ready(self, pm: QPixmap):
+    def on_preview_ready(self, seq: int, pm: QPixmap):
+        # Ignore stale previews
+        if seq != self._preview_seq:
+            return
         self.preview.setPixmap(pm); self.preview.setText(""); self.status.setText("")
 
-    def on_preview_failed(self, msg: str):
+    def on_preview_failed(self, seq: int, msg: str):
+        if seq != self._preview_seq:
+            return
         self.preview.setPixmap(QPixmap()); self.preview.setText("(Preview unavailable)"); self.status.setText("Screenshot error")
         QMessageBox.warning(self, "Preview error", msg)
 
@@ -248,6 +295,82 @@ class MainWindow(QMainWindow):
 
     def on_status(self, s: str):
         self.status.setText(s)
+
+    # ---- Edit operations ----
+    def _refresh_folders(self):
+        links = self._edit_links or []
+        folders = gather_folder_paths(links)
+        current = (self.folder_combo.currentData() or "")
+        self.folder_combo.blockSignals(True)
+        self.folder_combo.clear(); self.folder_combo.addItem("All folders", "")
+        for f in folders:
+            self.folder_combo.addItem(f, f)
+        # restore if still present
+        idx = self.folder_combo.findData(current)
+        if idx >= 0:
+            self.folder_combo.setCurrentIndex(idx)
+        else:
+            self.folder_combo.setCurrentIndex(0)
+        self.folder_combo.blockSignals(False)
+
+    def on_delete_selected(self):
+        sel_items = self.list.selectedIndexes()
+        if not sel_items:
+            return
+        if self._scan_thread and self._scan_thread.is_alive():
+            self.status.setText("Wait for scan to finish…"); return
+        if not self._edit_links:
+            return
+        # Delete ALL bookmarks whose normalized URL matches any selected row
+        selected_urls: Set[str] = set()
+        for idx in sel_items:
+            row = idx.row()
+            if 0 <= row < len(self.items):
+                url, _b = self.items[row]
+                selected_urls.add(url)
+        before = len(self._edit_links)
+        self._edit_links = [b for b in self._edit_links if normalize_url(b.href) not in selected_urls]
+        removed = before - len(self._edit_links)
+        self.status.setText(f"Deleted {removed} bookmark(s)")
+        self._refresh_folders()
+        # Clear preview + selection and rescan; also cancel any in-flight preview
+        self._preview_seq += 1
+        self.preview.setPixmap(QPixmap()); self.preview.setText("(Click a bookmark to preview)")
+        self.list.clearSelection()
+        self.on_scan()
+
+    def on_move_selected(self):
+        sel_items = self.list.selectedIndexes()
+        if not sel_items:
+            return
+        if self._scan_thread and self._scan_thread.is_alive():
+            self.status.setText("Wait for scan to finish…"); return
+        folders = gather_folder_paths(self._edit_links or [])
+        # Allow typing a new path too
+        dest, ok = QInputDialog.getItem(self, "Move to folder", "Destination folder:", folders, 0, True)
+        if not ok:
+            return
+        dest = (dest or "").strip().strip("/")
+        if not dest:
+            return
+        # Move ALL bookmarks whose normalized URL matches any selected row
+        selected_urls: Set[str] = set()
+        for idx in sel_items:
+            row = idx.row()
+            if 0 <= row < len(self.items):
+                url, _b = self.items[row]
+                selected_urls.add(url)
+        changed = 0
+        if self._edit_links:
+            for b in self._edit_links:
+                if normalize_url(b.href) in selected_urls:
+                    b.folder_path = dest
+                    changed += 1
+        self.status.setText(f"Moved {changed} bookmark(s)")
+        self._refresh_folders()
+        # cancel any in-flight preview and rescan
+        self._preview_seq += 1
+        self.on_scan()
 
     def on_clear_cache(self):
         clear_cache(); QMessageBox.information(self, "Cache", "Preview cache cleared.")
