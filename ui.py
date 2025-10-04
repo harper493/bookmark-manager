@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
     QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLabel, QLineEdit, QPushButton, QComboBox,
     QProgressBar, QMessageBox, QFileDialog, QAbstractItemView,
-    QDialog, QFormLayout, QDialogButtonBox, QCheckBox, QSpinBox, QDoubleSpinBox
+    QDialog, QFormLayout, QDialogButtonBox, QCheckBox, QSpinBox, QDoubleSpinBox,
+    QInputDialog,
 )
 
 from bookmarks import (
@@ -31,7 +32,7 @@ from utils import normalize_url, host_of, fit_image, filter_valid
 class Signals(QObject):
     progress = Signal(int)
     status = Signal(str)
-    list_filled = Signal(list)            # List[Tuple[str,BmLink]]
+    list_filled = Signal(list)            # List[Tuple[str, BmLink]]
     preview_ready = Signal(int, QPixmap)  # (seq, pixmap)
     preview_failed = Signal(int, str)     # (seq, message)
 
@@ -43,6 +44,8 @@ class OpenTabsDialog(QDialog):
         self.setWindowTitle("Open tabs")
         self.setModal(True)
         lay = QFormLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
 
         # Method
         self.method = QComboBox(self)
@@ -95,6 +98,8 @@ class MainWindow(QMainWindow):
 
         # --- Top controls (Row 1) ---
         top = QWidget(); top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(6, 6, 6, 0)
+        top_layout.setSpacing(6)
         self.file_edit = QLineEdit(); self.file_edit.setPlaceholderText("Select bookmarks HTML…")
         self.file_edit.returnPressed.connect(self.on_scan)
         browse_btn = QPushButton("Browse…"); browse_btn.clicked.connect(self.on_browse)
@@ -114,6 +119,8 @@ class MainWindow(QMainWindow):
 
         # --- Top controls (Row 2) — Chrome button under file selector ---
         chrome_row = QWidget(); chrome_layout = QHBoxLayout(chrome_row)
+        chrome_layout.setContentsMargins(6, 0, 6, 0)
+        chrome_layout.setSpacing(6)
         chrome_btn = QPushButton("Load from Chrome"); chrome_btn.clicked.connect(self.on_load_chrome)
         chrome_layout.addWidget(chrome_btn)
         chrome_layout.addStretch(1)
@@ -122,16 +129,22 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar(); self.progress.setMaximum(100)
         self.status = QLabel("Ready")
         statw = QWidget(); statl = QHBoxLayout(statw)
+        statl.setContentsMargins(6, 4, 6, 4)
+        statl.setSpacing(6)
         statl.addWidget(self.progress, 3); statl.addWidget(self.status, 1)
 
         # Split main area
         split = QSplitter(Qt.Horizontal)
         left = QWidget(); left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 6, 0)
+        left_layout.setSpacing(6)
         self.list = QListWidget(); self.list.itemSelectionChanged.connect(self.on_select)
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         left_layout.addWidget(self.list)
         # Row of actions below list
         list_row = QWidget(); list_row_l = QHBoxLayout(list_row)
+        list_row_l.setContentsMargins(0, 0, 0, 0)
+        list_row_l.setSpacing(6)
         del_btn = QPushButton("Delete selected"); del_btn.clicked.connect(self.on_delete_selected)
         move_btn = QPushButton("Move to folder…"); move_btn.clicked.connect(self.on_move_selected)
         list_row_l.addWidget(del_btn)
@@ -140,6 +153,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(list_row)
 
         right = QWidget(); right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(6)
         self.preview = QLabel("(Click a bookmark to preview)")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(QSize(300, 300))
@@ -149,21 +164,28 @@ class MainWindow(QMainWindow):
 
         # Central
         central = QWidget(); lay = QVBoxLayout(central)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(6)
         lay.addWidget(top)
         lay.addWidget(chrome_row)
         lay.addWidget(statw)
         lay.addWidget(split, 1)
 
-        # Bottom bar
+        # Bottom bar (left-aligned, compact)
         bottom = QWidget(); bottom_l = QHBoxLayout(bottom)
-        bottom_l.addStretch(1)
+        bottom_l.setContentsMargins(6, 0, 6, 6)
+        bottom_l.setSpacing(6)
+
         open_tabs_btn = QPushButton("Open tabs…"); open_tabs_btn.clicked.connect(self.on_open_tabs)
         export_btn = QPushButton("Export to HTML…"); export_btn.clicked.connect(self.on_export_html)
         save_json_btn = QPushButton("Save JSON…"); save_json_btn.clicked.connect(self.on_save_json)
         write_btn = QPushButton("Write back to Chrome…"); write_btn.clicked.connect(self.on_write_back)
         clear_btn = QPushButton("Clear preview cache"); clear_btn.clicked.connect(self.on_clear_cache)
+
         for b in (open_tabs_btn, export_btn, save_json_btn, write_btn, clear_btn):
+            b.setFixedHeight(28)
             bottom_l.addWidget(b)
+        bottom_l.addStretch(1)
         lay.addWidget(bottom)
 
         self.setCentralWidget(central)
@@ -270,6 +292,7 @@ class MainWindow(QMainWindow):
             else:
                 raise RuntimeError("No bookmarks source loaded.")
             sel = select_folder(links, folder)
+            # de-dupe
             seen: Set[str] = set(); deduped: List[Tuple[str, BmLink]] = []
             for b in sel:
                 n = normalize_url(b.href)
@@ -284,12 +307,14 @@ class MainWindow(QMainWindow):
 
     def on_list_filled(self, items: list):
         self.items = items
+        # Avoid triggering selection events while we fill
         self.list.blockSignals(True)
         self.list.clear()
         for u, b in items:
             it = QListWidgetItem(f"{b.title}   —   {host_of(u)}"); it.setData(Qt.UserRole, u)
             self.list.addItem(it)
         self.list.blockSignals(False)
+        # Ensure nothing is selected and no current item
         self.list.clearSelection()
         try:
             self.list.setCurrentRow(-1)
@@ -297,6 +322,7 @@ class MainWindow(QMainWindow):
             pass
         if not items:
             self.status.setText("No links found.")
+        # allow selection again
         self._ignore_selection = False
 
     def on_select(self):
@@ -309,6 +335,7 @@ class MainWindow(QMainWindow):
             return
         url = sel.data(Qt.UserRole)
         self.status.setText("Capturing screenshot…")
+        # start a new preview sequence; this cancels any late arrivals
         self._preview_seq += 1
         seq = self._preview_seq
         self._preview_thread = threading.Thread(target=self._worker_preview, args=(seq, url,), daemon=True)
@@ -329,6 +356,7 @@ class MainWindow(QMainWindow):
             self.sig.preview_failed.emit(seq, str(e))
 
     def on_preview_ready(self, seq: int, pm: QPixmap):
+        # Ignore stale previews
         if seq != self._preview_seq:
             return
         self.preview.setPixmap(pm); self.preview.setText(""); self.status.setText("")
@@ -354,6 +382,7 @@ class MainWindow(QMainWindow):
         self.folder_combo.clear(); self.folder_combo.addItem("All folders", "")
         for f in folders:
             self.folder_combo.addItem(f, f)
+        # restore if still present
         idx = self.folder_combo.findData(current)
         if idx >= 0:
             self.folder_combo.setCurrentIndex(idx)
@@ -369,6 +398,7 @@ class MainWindow(QMainWindow):
             self.status.setText("Wait for scan to finish…"); return
         if not self._edit_links:
             return
+        # Delete ALL bookmarks whose normalized URL matches any selected row
         selected_urls: Set[str] = set()
         for idx in sel_items:
             row = idx.row()
@@ -380,6 +410,7 @@ class MainWindow(QMainWindow):
         removed = before - len(self._edit_links)
         self.status.setText(f"Deleted {removed} bookmark(s)")
         self._refresh_folders()
+        # Clear preview + selection and rescan; also cancel any in-flight preview
         self._preview_seq += 1
         self.preview.setPixmap(QPixmap()); self.preview.setText("(Click a bookmark to preview)")
         self.list.clearSelection()
@@ -392,12 +423,14 @@ class MainWindow(QMainWindow):
         if self._scan_thread and self._scan_thread.is_alive():
             self.status.setText("Wait for scan to finish…"); return
         folders = gather_folder_paths(self._edit_links or [])
+        # Allow typing a new path too
         dest, ok = QInputDialog.getItem(self, "Move to folder", "Destination folder:", folders, 0, True)
         if not ok:
             return
         dest = (dest or "").strip().strip("/")
         if not dest:
             return
+        # Move ALL bookmarks whose normalized URL matches any selected row
         selected_urls: Set[str] = set()
         for idx in sel_items:
             row = idx.row()
@@ -412,6 +445,7 @@ class MainWindow(QMainWindow):
                     changed += 1
         self.status.setText(f"Moved {changed} bookmark(s)")
         self._refresh_folders()
+        # cancel any in-flight preview and rescan
         self._preview_seq += 1
         self.on_scan()
 
@@ -445,6 +479,7 @@ class MainWindow(QMainWindow):
             self.sig.status.emit(f"Opening {n} tab(s)…")
             self.sig.progress.emit(0)
             if use_playwright:
+                # Keep Chromium open after finishing by not using the context manager
                 from playwright.sync_api import sync_playwright
                 p = sync_playwright().start()
                 browser = None
@@ -457,6 +492,7 @@ class MainWindow(QMainWindow):
                         self.sig.progress.emit(int(i * 100 / n))
                         time.sleep(delay)
                     self.sig.status.emit(f"Opened {n} tab(s) in Playwright (window left open)")
+                    # Keep this worker alive until the user closes the browser window
                     while browser.is_connected():
                         time.sleep(0.5)
                 finally:
@@ -483,6 +519,7 @@ class MainWindow(QMainWindow):
 
     # ---- Write back to Chrome ----
     def _chrome_time_now_str(self) -> str:
+        # Chrome stores microseconds since 1601-01-01 UTC as a string
         epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         micros = int((now - epoch).total_seconds() * 1_000_000)
@@ -505,6 +542,7 @@ class MainWindow(QMainWindow):
         if not self._edit_links:
             QMessageBox.information(self, "Write", "Nothing to write — no bookmarks loaded.")
             return
+        # Choose target profile/bookmarks file
         target_path: Optional[Path] = self._chrome_profile_path
         target_name: Optional[str] = self._chrome_profile_name
         if target_path is None:
@@ -523,6 +561,7 @@ class MainWindow(QMainWindow):
                 idx = names.index(name)
                 target_name, p = profiles[idx]
                 target_path = Path(p)
+        # Final confirmation
         if QMessageBox.question(
             self, "Write back to Chrome",
             f"This will overwrite\n\n{target_name}\n{target_path}\n\nClose Chrome first. Continue?",
@@ -531,6 +570,7 @@ class MainWindow(QMainWindow):
         ) != QMessageBox.Yes:
             return
         try:
+            # Load existing skeleton if present
             data: Dict[str, Any]
             if target_path.exists():
                 with open(target_path, "r", encoding="utf-8") as f:
@@ -538,6 +578,7 @@ class MainWindow(QMainWindow):
             else:
                 data = {}
             roots = data.get("roots") or {}
+            # Ensure roots exist
             def ensure_root(key: str, name: str, fallback_id: str) -> Dict[str, Any]:
                 node = roots.get(key)
                 if not isinstance(node, dict):
@@ -550,7 +591,10 @@ class MainWindow(QMainWindow):
             oth = ensure_root("other", "Other bookmarks", "2")
             syn = ensure_root("synced", "Mobile bookmarks", "3")
 
+            # Fresh children we will build
             new_children: Dict[str, List[Dict[str, Any]]] = {"bookmark_bar": [], "other": [], "synced": []}
+
+            # ID generator (continue from current max id)
             max_id = 0
             for k in ("bookmark_bar", "other", "synced"):
                 max_id = max(max_id, self._scan_max_id(roots.get(k) or {}))
@@ -560,6 +604,8 @@ class MainWindow(QMainWindow):
                 return str(max_id)
 
             now_s = self._chrome_time_now_str()
+
+            # Helpers to build nested folders under a root
             def ensure_folder(children: List[Dict[str, Any]], name: str) -> Dict[str, Any]:
                 for ch in children:
                     if ch.get("type") == "folder" and ch.get("name") == name:
@@ -570,10 +616,12 @@ class MainWindow(QMainWindow):
 
             ROOT_NAME_TO_KEY = {"bookmarks bar": "bookmark_bar", "other bookmarks": "other", "mobile bookmarks": "synced"}
 
+            # Build trees from edited links
             for b in list(self._edit_links):
                 url = normalize_url(b.href)
                 if not url:
                     continue
+                # Determine root and subpath
                 parts = (b.folder_path or "").strip("/").split("/") if b.folder_path else []
                 root_key = None
                 if parts:
@@ -583,21 +631,33 @@ class MainWindow(QMainWindow):
                         parts = parts[1:]
                 if not root_key:
                     root_key = "other"
+                # Walk/construct folders
                 cur_children = new_children[root_key]
                 for seg in parts:
                     if not seg:
                         continue
                     folder = ensure_folder(cur_children, seg)
                     cur_children = folder["children"]
-                node = {"type": "url", "name": b.title or url, "url": url, "id": next_id(), "date_added": now_s}
+                # Add URL node
+                node = {
+                    "type": "url",
+                    "name": b.title or url,
+                    "url": url,
+                    "id": next_id(),
+                    "date_added": now_s,
+                }
                 cur_children.append(node)
 
-            bar["children"], oth["children"], syn["children"] = new_children["bookmark_bar"], new_children["other"], new_children["synced"]
+            # Swap children
+            bar["children"], oth["children"], syn["children"] = (
+                new_children["bookmark_bar"], new_children["other"], new_children["synced"]
+            )
             data["roots"] = roots
-            data.pop("checksum", None)
+            data.pop("checksum", None)  # let Chrome recompute
             if "version" not in data:
                 data["version"] = 1
 
+            # Backup & write
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             backup = target_path.with_name(target_path.name + f".backup-{ts}.json")
             try:
@@ -614,6 +674,10 @@ class MainWindow(QMainWindow):
 
     # ---- Export / Save ----
     def _build_folder_tree(self) -> Dict[str, Any]:
+        """Return a nested folder tree: {name, children:[folders|links]} from self._edit_links.
+        Links look like {type:'url', title, url}. Folders: {type:'folder', name, children}.
+        Root is an anonymous folder.
+        """
         root = {"type": "folder", "name": "ROOT", "children": []}
         def ensure_path(parts: List[str]) -> List[Dict[str, Any]]:
             cur = root["children"]
@@ -637,7 +701,11 @@ class MainWindow(QMainWindow):
             parts = (b.folder_path or "").strip("/")
             parts_list = [p for p in parts.split("/") if p] if parts else []
             cur_children = ensure_path(parts_list)
-            cur_children.append({"type": "url", "title": b.title or url, "url": url})
+            cur_children.append({
+                "type": "url",
+                "title": b.title or url,
+                "url": url,
+            })
         return root
 
     def _export_tree_to_html(self, node: Dict[str, Any], out, level: int = 0):
@@ -645,13 +713,19 @@ class MainWindow(QMainWindow):
         now_unix = str(int(datetime.now(timezone.utc).timestamp()))
         if node.get("type") == "folder":
             name = html.escape(node.get("name", ""))
-            if level > 0:
+            if level > 0:  # skip writing a heading for the anonymous root
                 out.write(f"{IND}<DT><H3 ADD_DATE=\"{now_unix}\">{name}</H3>\n")
-            out.write(("<DL><p>\n" if level == 0 else f"{IND}<DL><p>\n"))
+            if level == 0:
+                out.write(f"<DL><p>\n")
+            else:
+                out.write(f"{IND}<DL><p>\n")
             for ch in node.get("children", []):
                 self._export_tree_to_html(ch, out, level + 1)
-            out.write(("</DL><p>\n" if level == 0 else f"{IND}</DL><p>\n"))
-        else:
+            if level == 0:
+                out.write(f"</DL><p>\n")
+            else:
+                out.write(f"{IND}</DL><p>\n")
+        else:  # url
             title = html.escape(node.get("title", ""))
             url = html.escape(node.get("url", ""))
             out.write(f"{IND}<DT><A HREF=\"{url}\" ADD_DATE=\"{now_unix}\">{title}</A>\n")
