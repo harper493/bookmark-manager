@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, threading, json, shutil, html
+import os, threading, json, shutil, html, time, webbrowser
 from typing import List, Tuple, Optional, Set, Dict, Any
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +40,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bookmark Viewer (Qt)")
-        self.resize(1100, 700)
+        self.resize(1200, 760)
 
         self.sig = Signals()
         self.sig.progress.connect(self.on_progress)
@@ -113,11 +113,12 @@ class MainWindow(QMainWindow):
         # Bottom bar
         bottom = QWidget(); bottom_l = QHBoxLayout(bottom)
         bottom_l.addStretch(1)
+        open_tabs_btn = QPushButton("Open tabs…"); open_tabs_btn.clicked.connect(self.on_open_tabs)
         export_btn = QPushButton("Export to HTML…"); export_btn.clicked.connect(self.on_export_html)
         save_json_btn = QPushButton("Save JSON…"); save_json_btn.clicked.connect(self.on_save_json)
         write_btn = QPushButton("Write back to Chrome…"); write_btn.clicked.connect(self.on_write_back)
         clear_btn = QPushButton("Clear preview cache"); clear_btn.clicked.connect(self.on_clear_cache)
-        for b in (export_btn, save_json_btn, write_btn, clear_btn):
+        for b in (open_tabs_btn, export_btn, save_json_btn, write_btn, clear_btn):
             bottom_l.addWidget(b)
         lay.addWidget(bottom)
 
@@ -127,6 +128,7 @@ class MainWindow(QMainWindow):
         self.items: List[Tuple[str, BmLink]] = []
         self._preview_thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
+        self._open_thread: Optional[threading.Thread] = None
         self._links_cache: Optional[List[BmLink]] = None
         self._edit_links: Optional[List[BmLink]] = None  # editable working set
         self._ignore_selection: bool = False            # suppress preview during refreshes
@@ -382,6 +384,83 @@ class MainWindow(QMainWindow):
         # cancel any in-flight preview and rescan
         self._preview_seq += 1
         self.on_scan()
+
+    # ---- Open tabs (bulk) ----
+    def on_open_tabs(self):
+        if not self.items:
+            QMessageBox.information(self, "Open tabs", "No bookmarks to open — scan or change folder first.")
+            return
+        # Ask for delay
+        delay, ok = QInputDialog.getDouble(self, "Open tabs", "Delay between tabs (seconds):", 1.0, 0.0, 60.0, 2)
+        if not ok:
+            return
+        # Ask for count
+        count, ok = QInputDialog.getInt(self, "Open tabs", f"How many to open? (0 = all, max {len(self.items)}):", 0, 0, len(self.items), 1)
+        if not ok:
+            return
+        # Choose method: Playwright or system browser
+        use_pw = QMessageBox.question(
+            self, "Open method",
+            ("Use Playwright (opens a new Chromium window)?\n"
+             "Choose 'No' to use your system default browser."),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) == QMessageBox.Yes
+        urls = [u for (u, _b) in self.items]
+        if count > 0:
+            urls = urls[:count]
+        if self._open_thread and self._open_thread.is_alive():
+            QMessageBox.information(self, "Open tabs", "A bulk open is already running.")
+            return
+        self._open_thread = threading.Thread(target=self._worker_open_tabs, args=(urls, delay, use_pw), daemon=True)
+        self._open_thread.start()
+
+    def _worker_open_tabs(self, urls: List[str], delay: float, use_playwright: bool):
+        try:
+            n = len(urls)
+            if n == 0:
+                self.sig.status.emit("Nothing to open."); return
+            self.sig.status.emit(f"Opening {n} tab(s)…")
+            self.sig.progress.emit(0)
+            if use_playwright:
+                # Lazy import to keep GUI startup fast
+                from playwright.sync_api import sync_playwright
+                p = sync_playwright().start()
+                browser = None
+                try:
+                    browser = p.chromium.launch(headless=False)
+                    context = browser.new_context(viewport={"width": 1280, "height": 900})
+                    for i, u in enumerate(urls, start=1):
+                        page = context.new_page()
+                        page.goto(u, wait_until="domcontentloaded")
+                        self.sig.progress.emit(int(i * 100 / n))
+                        time.sleep(delay)
+
+                    self.sig.status.emit(f"Opened {n} tab(s) in Playwright (window left open)")
+                    # Keep this worker alive until the user closes the window
+                    while browser.is_connected():
+                        time.sleep(0.5)
+                finally:
+                    try:
+                        if browser and browser.is_connected():
+                            browser.close()
+                    except Exception:
+                        pass
+                    try:
+                        p.stop()
+                    except Exception:
+                        pass
+            else:
+                for i, u in enumerate(urls, start=1):
+                    try:
+                        webbrowser.open_new_tab(u)
+                    except Exception:
+                        # fallback to open_new
+                        webbrowser.open(u)
+                    self.sig.progress.emit(int(i * 100 / n))
+                    time.sleep(delay)
+            self.sig.status.emit(f"Opened {n} tab(s)")
+        except Exception as e:
+            self.sig.status.emit(f"Open error: {e}")
 
     # ---- Write back to Chrome ----
     def _chrome_time_now_str(self) -> str:
